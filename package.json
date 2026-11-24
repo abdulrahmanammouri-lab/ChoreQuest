@@ -1,0 +1,14 @@
+{
+  "name": "chorequest",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Weekly chore schedule for roommates, shared through a household ID.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

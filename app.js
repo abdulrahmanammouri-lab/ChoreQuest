@@ -5,18 +5,31 @@
   const mount = document.getElementById("app");
   if (!CQ || !mount) return;
 
-  const STORAGE_KEY = "chorequest.v1";
+  const HOUSEHOLD_KEY = "chorequest.household";
+  const LEGACY_KEY = "chorequest.v1";
+  const ID_LENGTH = 6;
+  const POLL_MS = 5000;
+  const OFFLINE = "Can't reach the ChoreQuest server. Make sure it is running, then try again.";
   const PALETTE = ["#1f4d3a", "#c4552a", "#2d5572", "#6d3b4f", "#8a5a22", "#1f6a62"];
   const CHORE_HINTS = ["Take out trash", "Dishes", "Vacuum", "Bathroom", "Recycling", "Mop the floors"];
 
   let state = CQ.blankState();
+  let householdId = "";
+  let phase = "loading";
   let draft = null;
   let view = "week";
   let formError = "";
+  let joinCode = "";
+  let joinError = "";
   let banner = "";
+  let bannerTone = "info";
   let focusSelector = "";
   let lastWeekKey = "";
   let lastAnnouncedMinute = -1;
+  let saving = false;
+  let pending = 0;
+  let polling = false;
+  let syncVersion = 0;
 
   function esc(value) {
     return String(value)
@@ -42,12 +55,49 @@
     return trimmed ? trimmed[0].toUpperCase() : "?";
   }
 
+  function cleanId(value) {
+    return String(value || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+  }
+
+  function readLocal(key) {
+    try {
+      return localStorage.getItem(key) || "";
+    } catch {
+      return "";
+    }
+  }
+
+  function writeLocal(key, value) {
+    try {
+      if (value) localStorage.setItem(key, value);
+      else localStorage.removeItem(key);
+    } catch {
+      // The household still works for this visit; the browser just won't remember it.
+    }
+  }
+
+  function legacyState() {
+    try {
+      const raw = localStorage.getItem(LEGACY_KEY);
+      const saved = CQ.normalize(raw ? JSON.parse(raw) : null);
+      return saved.onboarded ? saved : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function setBanner(text, tone = "info") {
+    banner = text;
+    bannerTone = tone;
+  }
+
   function defaultDraft() {
-    if (state.onboarded) {
+    const source = state.onboarded ? state : householdId ? null : legacyState();
+    if (source) {
       return {
-        apartmentName: state.apartmentName,
-        roommates: state.roommates.map((person) => ({ ...person })),
-        chores: state.chores.map((chore) => ({ ...chore })),
+        apartmentName: source.apartmentName,
+        roommates: source.roommates.map((person) => ({ ...person })),
+        chores: source.chores.map((chore) => ({ ...chore })),
       };
     }
     return {
@@ -64,32 +114,37 @@
     };
   }
 
-  function load() {
-    let next = CQ.blankState();
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      next = CQ.normalize(raw ? JSON.parse(raw) : null);
-    } catch {
-      return CQ.blankState();
-    }
-    try {
-      if (next.onboarded && CQ.refresh(next, new Date())) {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
-      }
-    } catch {
-      // Keep the household in memory even if this browser refuses another write.
-    }
-    return next;
+  async function api(method, url, body) {
+    const response = await fetch(url, {
+      method,
+      headers: body ? { "Content-Type": "application/json" } : {},
+      body: body ? JSON.stringify(body) : undefined,
+      cache: "no-store",
+    });
+    const data = response.status === 204 ? {} : await response.json().catch(() => ({}));
+    return { ok: response.ok, status: response.status, data };
   }
 
-  function persist() {
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-      return true;
-    } catch {
-      banner = "Could not save on this device. Free some browser storage and try again.";
-      return false;
-    }
+  function adopt(data) {
+    householdId = data.id;
+    writeLocal(HOUSEHOLD_KEY, householdId);
+    state = CQ.normalize(data.state);
+    CQ.refresh(state, new Date());
+    lastWeekKey = state.onboarded ? CQ.weekKey(new Date()) : "";
+    syncVersion += 1;
+  }
+
+  function forget(message) {
+    householdId = "";
+    writeLocal(HOUSEHOLD_KEY, "");
+    state = CQ.blankState();
+    view = "week";
+    formError = "";
+    joinError = "";
+    lastWeekKey = "";
+    syncVersion += 1;
+    draft = defaultDraft();
+    setBanner(message || "");
   }
 
   function formatRange(sunday) {
@@ -119,7 +174,10 @@
   }
 
   function bannerHtml() {
-    return banner ? `<p class="banner" role="status">${esc(banner)}</p>` : "";
+    if (!banner) return "";
+    return bannerTone === "error"
+      ? `<p class="alert" role="alert">${esc(banner)}</p>`
+      : `<p class="banner" role="status">${esc(banner)}</p>`;
   }
 
   function digitBlocks() {
@@ -153,11 +211,15 @@
 
   function formMarkup(mode) {
     const count = draft.roommates.length;
-    const heading = mode === "welcome" ? `<h2>Set up the household</h2>` : "";
-    return `<form class="household-form" novalidate autocomplete="off">
+    const heading = mode === "welcome" ? `<h2>Create a household</h2>` : "";
+    const imported = mode === "welcome" && legacyState()
+      ? `<p class="hint">This is filled in from the household saved in this browser. Its history comes along when you create it.</p>`
+      : "";
+    return `<form class="household-form" data-form="household" novalidate autocomplete="off">
       ${formError ? `<p class="alert" role="alert">${esc(formError)}</p>` : ""}
       ${heading}
       <p class="hint">Type the chores and how many roommates share the place. Order is the rotation: each Sunday, every chore moves to the next person.</p>
+      ${imported}
       <div class="field">
         <label for="apartment-name">Apartment name</label>
         <input id="apartment-name" type="text" maxlength="48" data-field="apartment" value="${esc(draft.apartmentName)}" placeholder="Maple Street">
@@ -184,10 +246,24 @@
         <button type="button" class="btn secondary" data-action="add-chore" ${draft.chores.length >= CQ.MAX_CHORES ? "disabled" : ""}>Add a chore</button>
       </fieldset>
       <div class="form-actions">
-        <button class="btn" type="submit">${mode === "welcome" ? "Start the week" : "Save household"}</button>
-        ${state.onboarded ? `<button class="btn danger" type="button" data-action="reset">Clear household</button>` : ""}
+        <button class="btn" type="submit">${mode === "welcome" ? "Create household" : "Save household"}</button>
+        ${state.onboarded ? `<button class="btn secondary" type="button" data-action="leave">Leave on this device</button>` : ""}
+        ${state.onboarded ? `<button class="btn danger" type="button" data-action="reset">Delete household</button>` : ""}
       </div>
     </form>`;
+  }
+
+  function joinMarkup() {
+    return `<form class="join-form" data-form="join" novalidate autocomplete="off">
+      <label for="join-id">Already have a household? Enter ID</label>
+      <div class="join-row">
+        <input id="join-id" type="text" data-field="join" value="${esc(joinCode)}" placeholder="6 letters and numbers" autocapitalize="characters" spellcheck="false" aria-describedby="join-help">
+        <button class="btn" type="submit">Join</button>
+      </div>
+      <p class="hint" id="join-help">Whoever created the household can find the ID on its dashboard.</p>
+      ${joinError ? `<p class="alert" role="alert">${esc(joinError)}</p>` : ""}
+    </form>
+    <p class="divider"><span>or create a new one</span></p>`;
   }
 
   function welcome() {
@@ -204,17 +280,44 @@
             <li><strong>One month</strong><span>Finished weeks stay on the dashboard for 30 days.</span></li>
           </ol>
         </div>
-        <p class="story-foot">Saved in this browser. No account.</p>
+        <p class="story-foot">Shared through the household ID. No account.</p>
       </section>
       <section class="welcome-form">
         ${bannerHtml()}
+        ${joinMarkup()}
         ${formMarkup("welcome")}
       </section>
     </div>`;
   }
 
+  function statusScreen() {
+    const offline = phase === "offline";
+    return `<div class="status-screen">
+      <div>
+        ${logo()}
+        <h1>ChoreQuest</h1>
+        <p class="hint" ${offline ? 'role="alert"' : 'role="status"'}>${offline ? esc(OFFLINE) : "Loading your household…"}</p>
+        ${offline ? `<div class="form-actions">
+          <button class="btn" type="button" data-action="retry">Try again</button>
+          <button class="btn secondary" type="button" data-action="leave">Use a different household</button>
+        </div>` : ""}
+      </div>
+    </div>`;
+  }
+
   function navButton(id, label, current) {
     return `<button type="button" data-action="nav" data-view="${id}" ${current ? 'aria-current="page"' : ""}>${label}</button>`;
+  }
+
+  function idCard() {
+    return `<div class="side-id">
+      <p>Household ID</p>
+      <div class="id-row">
+        <strong class="id-code">${esc(householdId)}</strong>
+        <button type="button" class="copy-id" data-action="copy-id">Copy</button>
+      </div>
+      <p class="fine">Roommates enter this to join.</p>
+    </div>`;
   }
 
   function sidebar() {
@@ -226,11 +329,12 @@
         ${navButton("week", "Board", onBoard)}
         ${navButton("household", "Household", view === "household")}
       </nav>
+      ${idCard()}
       <div class="side-timer">
         <p>Resets Sunday</p>
         <p class="side-digits" aria-hidden="true"><span data-unit="days">00</span>d <span data-unit="hours">00</span>h <span data-unit="minutes">00</span>m <span data-unit="seconds">00</span>s</p>
         <div class="track" aria-hidden="true"><span data-week-progress></span></div>
-        <p class="fine">Saved on this device</p>
+        <p class="fine">Synced with your roommates</p>
       </div>
       <p class="sr-only" data-timer-live aria-live="polite"></p>
     </aside>`;
@@ -341,7 +445,7 @@
   function householdView() {
     return `<section class="panel">
       <p class="timer-strip" aria-hidden="true">Sunday reset in <span data-unit="days">00</span>d <span data-unit="hours">00</span>h <span data-unit="minutes">00</span>m <span data-unit="seconds">00</span>s</p>
-      <p class="eyebrow">Household</p>
+      <p class="eyebrow">Household · ID ${esc(householdId)}</p>
       <h1>Who lives here</h1>
       ${formMarkup("edit")}
     </section>`;
@@ -382,7 +486,7 @@
   function render(options = {}) {
     const scroll = options.scroll || "keep";
     const y = scroll === "keep" ? window.scrollY : 0;
-    mount.innerHTML = state.onboarded ? shell() : welcome();
+    mount.innerHTML = phase !== "ready" ? statusScreen() : state.onboarded ? shell() : welcome();
     document.title = state.onboarded && state.apartmentName ? `${state.apartmentName} · ChoreQuest` : "ChoreQuest";
     paintTimer();
     window.scrollTo(0, y);
@@ -391,6 +495,17 @@
       if (target) target.focus({ preventScroll: true });
       focusSelector = "";
     }
+  }
+
+  function repaint() {
+    if (view !== "household" || !state.onboarded) render({ scroll: "keep" });
+  }
+
+  function markBusy(selector, label) {
+    const button = document.querySelector(selector);
+    if (!button) return;
+    button.disabled = true;
+    button.textContent = label;
   }
 
   function paintRoommateFields() {
@@ -462,42 +577,235 @@
     render({ scroll: "top" });
   }
 
-  function saveHousehold() {
+  async function saveHousehold() {
+    if (saving) return;
     const countInput = document.querySelector("[data-field='count']");
     if (countInput && countInput.value !== "") resizeRoommates(Number(countInput.value));
-    const result = CQ.applyHousehold(state, draft, new Date());
-    if (!result.ok) {
-      formError = result.error;
+    const check = CQ.applyHousehold(state, draft, new Date());
+    if (!check.ok) {
+      formError = check.error;
       render({ scroll: "keep" });
       return;
     }
-    state = result.state;
+
+    const creating = !householdId;
+    saving = true;
+    markBusy(".household-form [type='submit']", creating ? "Creating…" : "Saving…");
+    let result;
+    try {
+      result = creating
+        ? await api("POST", "/api/households", { household: draft, legacy: legacyState() })
+        : await api("PUT", `/api/households/${householdId}`, { household: draft });
+    } catch {
+      result = null;
+    }
+    saving = false;
+
+    if (!result) {
+      formError = OFFLINE;
+      render({ scroll: "keep" });
+      return;
+    }
+    if (!result.ok) {
+      if (!creating && result.status === 404) {
+        forget("A roommate deleted this household. Create a new one or enter another ID.");
+        render({ scroll: "top" });
+        return;
+      }
+      formError = result.data.error || "Could not save the household. Try again.";
+      render({ scroll: "keep" });
+      return;
+    }
+
+    adopt(result.data);
+    if (creating) {
+      writeLocal(LEGACY_KEY, "");
+      setBanner(`Household created. Share the ID ${householdId} with your roommates so they can join.`);
+    } else {
+      setBanner("");
+    }
     formError = "";
-    banner = "";
     view = "week";
     draft = defaultDraft();
-    lastWeekKey = CQ.weekKey(new Date());
-    persist();
     render({ scroll: "top" });
   }
 
-  function resetHousehold() {
-    const confirmed = window.confirm("Clear every roommate, chore, and the saved month of history on this device?");
+  async function joinHousehold() {
+    if (saving) return;
+    const id = cleanId(joinCode);
+    if (id.length !== ID_LENGTH) {
+      joinError = "Household IDs are 6 letters and numbers.";
+      focusSelector = "#join-id";
+      render({ scroll: "keep" });
+      return;
+    }
+
+    saving = true;
+    markBusy(".join-form [type='submit']", "Joining…");
+    try {
+      const result = await api("GET", `/api/households/${id}`);
+      if (result.ok) {
+        adopt(result.data);
+        joinCode = "";
+        joinError = "";
+        formError = "";
+        setBanner("");
+        view = "week";
+        draft = defaultDraft();
+      } else {
+        joinError = result.data.error || "Could not open that household.";
+        focusSelector = "#join-id";
+      }
+    } catch {
+      joinError = OFFLINE;
+    }
+    saving = false;
+    render({ scroll: state.onboarded ? "top" : "keep" });
+  }
+
+  async function deleteHousehold() {
+    const confirmed = window.confirm(`Delete this household for everyone? Every roommate using ID ${householdId} loses the chores and the month of history.`);
     if (!confirmed) return;
-    state = CQ.blankState();
-    draft = defaultDraft();
-    view = "week";
-    formError = "";
-    banner = "";
-    lastWeekKey = "";
-    persist();
+    try {
+      const result = await api("DELETE", `/api/households/${householdId}`);
+      if (!result.ok && result.status !== 404) {
+        setBanner(result.data.error || "Could not delete the household. Try again.", "error");
+        render({ scroll: "top" });
+        return;
+      }
+    } catch {
+      setBanner(OFFLINE, "error");
+      render({ scroll: "top" });
+      return;
+    }
+    forget("");
     render({ scroll: "top" });
   }
 
-  function toggle(weekKeyValue, choreId) {
-    if (!CQ.toggleDone(state, weekKeyValue, choreId)) return;
-    persist();
+  function leaveHousehold() {
+    if (state.onboarded) {
+      const confirmed = window.confirm(`Leave this household on this device? You can come back any time with the ID ${householdId}.`);
+      if (!confirmed) return;
+    }
+    forget("");
+    phase = "ready";
+    render({ scroll: "top" });
+  }
+
+  async function toggle(weekKeyValue, choreId) {
+    const week = state.weeks[weekKeyValue];
+    const item = week && week.assignments.find((assignment) => assignment.choreId === choreId);
+    if (!item) return;
+    const done = !item.done;
+    CQ.setDone(state, weekKeyValue, choreId, done);
+    syncVersion += 1;
     render({ scroll: "keep" });
+
+    pending += 1;
+    try {
+      const result = await api("POST", `/api/households/${householdId}/done`, { week: weekKeyValue, choreId, done });
+      if (result.status === 404) {
+        forget("A roommate deleted this household. Create a new one or enter another ID.");
+      } else if (result.data.state) {
+        adopt(result.data);
+        setBanner(result.ok ? "" : result.data.error, result.ok ? "info" : "error");
+      } else {
+        CQ.setDone(state, weekKeyValue, choreId, !done);
+        setBanner(result.data.error || "Could not save that check-off. Try again.", "error");
+      }
+    } catch {
+      CQ.setDone(state, weekKeyValue, choreId, !done);
+      setBanner(OFFLINE, "error");
+    }
+    pending -= 1;
+    repaint();
+  }
+
+  async function copyId(button) {
+    let copied = false;
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(householdId);
+        copied = true;
+      }
+    } catch {
+      copied = false;
+    }
+    if (!copied) {
+      const area = document.createElement("textarea");
+      area.value = householdId;
+      area.setAttribute("readonly", "");
+      area.style.position = "fixed";
+      area.style.opacity = "0";
+      document.body.appendChild(area);
+      area.select();
+      try {
+        copied = document.execCommand("copy");
+      } catch {
+        copied = false;
+      }
+      area.remove();
+    }
+    button.textContent = copied ? "Copied" : "Copy failed";
+    window.setTimeout(() => {
+      if (button.isConnected) button.textContent = "Copy";
+    }, 1600);
+  }
+
+  async function poll() {
+    if (!householdId || phase !== "ready" || pending || saving || polling) return;
+    if (document.visibilityState !== "visible") return;
+    const startedAt = syncVersion;
+    polling = true;
+    try {
+      const result = await api("GET", `/api/households/${householdId}`);
+      if (syncVersion !== startedAt) return;
+      if (result.ok) {
+        const before = JSON.stringify(state);
+        const wasOffline = banner === OFFLINE;
+        adopt(result.data);
+        if (wasOffline) setBanner("");
+        if (wasOffline || JSON.stringify(state) !== before) repaint();
+      } else if (result.status === 404) {
+        forget("A roommate deleted this household. Create a new one or enter another ID.");
+        render({ scroll: "top" });
+      }
+    } catch {
+      if (syncVersion === startedAt && banner !== OFFLINE) {
+        setBanner(OFFLINE, "error");
+        repaint();
+      }
+    } finally {
+      polling = false;
+    }
+  }
+
+  async function boot() {
+    householdId = cleanId(readLocal(HOUSEHOLD_KEY));
+    state = CQ.blankState();
+    view = "week";
+    if (!householdId) {
+      phase = "ready";
+      draft = defaultDraft();
+      render({ scroll: "top" });
+      return;
+    }
+
+    phase = "loading";
+    render({ scroll: "top" });
+    try {
+      const result = await api("GET", `/api/households/${householdId}`);
+      if (result.ok) adopt(result.data);
+      else if (result.status === 404) forget("That household was deleted. Create a new one or enter another ID.");
+      else throw new Error(result.data.error);
+    } catch {
+      phase = "offline";
+      render({ scroll: "top" });
+      return;
+    }
+    phase = "ready";
+    draft = defaultDraft();
+    render({ scroll: "top" });
   }
 
   function onClick(event) {
@@ -516,12 +824,21 @@
       move(draft.chores, Number(button.dataset.index), Number(button.dataset.delta));
       paintChoreFields();
     } else if (action === "toggle") toggle(button.dataset.week, button.dataset.chore);
-    else if (action === "reset") resetHousehold();
+    else if (action === "reset") deleteHousehold();
+    else if (action === "leave") leaveHousehold();
+    else if (action === "retry") boot();
+    else if (action === "copy-id") copyId(button);
   }
 
   function onInput(event) {
     const input = event.target;
-    if (!(input instanceof HTMLInputElement) || !draft) return;
+    if (!(input instanceof HTMLInputElement)) return;
+    if (input.dataset.field === "join") {
+      joinCode = cleanId(input.value).slice(0, ID_LENGTH);
+      if (input.value !== joinCode) input.value = joinCode;
+      return;
+    }
+    if (!draft) return;
     const index = Number(input.dataset.index);
     if (input.dataset.field === "apartment") draft.apartmentName = input.value;
     if (input.dataset.field === "roommate" && draft.roommates[index]) draft.roommates[index].name = input.value;
@@ -538,13 +855,14 @@
   function onSubmit(event) {
     if (!(event.target instanceof HTMLFormElement)) return;
     event.preventDefault();
-    saveHousehold();
+    if (event.target.dataset.form === "join") joinHousehold();
+    else saveHousehold();
   }
 
   function onKeydown(event) {
     if (event.key !== "Enter" || !(event.target instanceof HTMLInputElement)) return;
     const input = event.target;
-    if (!input.closest("form") || !draft) return;
+    if (!input.closest("form") || input.dataset.field === "join" || !draft) return;
     if (input.dataset.field === "count") {
       event.preventDefault();
       if (input.value !== "") resizeRoommates(Number(input.value));
@@ -563,12 +881,9 @@
   }
 
   function onStorage(event) {
-    if (event.key !== STORAGE_KEY) return;
-    state = load();
-    if (!state.onboarded || view === "household") draft = defaultDraft();
-    if (!state.onboarded) view = "week";
-    lastWeekKey = state.onboarded ? CQ.weekKey(new Date()) : "";
-    render({ scroll: "keep" });
+    if (event.key !== HOUSEHOLD_KEY) return;
+    if (cleanId(event.newValue) === householdId) return;
+    boot();
   }
 
   function catchUp() {
@@ -576,21 +891,18 @@
       paintTimer();
       return;
     }
-    const changed = CQ.refresh(state, new Date());
+    CQ.refresh(state, new Date());
     const key = CQ.weekKey(new Date());
-    if (changed) persist();
     if (key !== lastWeekKey) {
       lastWeekKey = key;
-      render({ scroll: "keep" });
+      repaint();
+      poll();
       return;
     }
     paintTimer();
   }
 
   function init() {
-    state = load();
-    draft = defaultDraft();
-    lastWeekKey = state.onboarded ? CQ.weekKey(new Date()) : "";
     document.addEventListener("click", onClick);
     document.addEventListener("input", onInput);
     document.addEventListener("change", onChange);
@@ -598,10 +910,13 @@
     document.addEventListener("keydown", onKeydown);
     window.addEventListener("storage", onStorage);
     document.addEventListener("visibilitychange", () => {
-      if (document.visibilityState === "visible") catchUp();
+      if (document.visibilityState !== "visible") return;
+      catchUp();
+      poll();
     });
-    render({ scroll: "top" });
+    boot();
     window.setInterval(catchUp, 1000);
+    window.setInterval(poll, POLL_MS);
   }
 
   init();

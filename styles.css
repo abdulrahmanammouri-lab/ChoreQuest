@@ -311,6 +311,137 @@ input[type="text"] {
   align-items: center;
 }
 
+.form-actions .btn.secondary {
+  margin-top: 0;
+}
+
+.join-form {
+  max-width: 640px;
+  border-radius: 18px;
+  background: var(--card);
+  padding: 18px;
+  box-shadow: var(--shadow);
+}
+
+.join-form label {
+  font-family: var(--display);
+  font-size: 22px;
+  font-weight: 500;
+}
+
+.join-row {
+  display: flex;
+  gap: 8px;
+}
+
+.join-row input {
+  min-width: 0;
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+}
+
+.join-row input::placeholder {
+  font-size: 15px;
+  font-weight: 400;
+  letter-spacing: normal;
+  text-transform: none;
+}
+
+.join-form .hint {
+  margin: 8px 0 0;
+  font-size: 14px;
+}
+
+.join-form .alert {
+  margin: 10px 0 0;
+}
+
+.divider {
+  display: flex;
+  max-width: 640px;
+  align-items: center;
+  gap: 12px;
+  margin: 28px 0 8px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.divider::before,
+.divider::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--line);
+}
+
+.status-screen {
+  display: grid;
+  min-height: 100vh;
+  place-items: center;
+  padding: 24px;
+  text-align: center;
+}
+
+.status-screen h1 {
+  margin: 12px 0 8px;
+  font-size: 48px;
+}
+
+.status-screen .form-actions {
+  justify-content: center;
+  margin-top: 18px;
+}
+
+.side-id {
+  margin-top: 22px;
+  border-radius: 14px;
+  background: rgba(246, 240, 230, 0.08);
+  padding: 12px;
+}
+
+.side-id > p:first-child {
+  margin: 0 0 4px;
+  color: var(--gold);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.id-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 4px;
+}
+
+.id-code {
+  font-size: 24px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.14em;
+  user-select: all;
+}
+
+.copy-id {
+  border: 1px solid rgba(246, 240, 230, 0.3);
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  padding: 6px 12px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.copy-id:hover {
+  background: rgba(246, 240, 230, 0.1);
+}
+
 .alert,
 .banner {
   border-radius: 12px;
@@ -768,6 +899,10 @@ input[type="text"] {
 
   .nav {
     flex-direction: row;
+  }
+
+  .side-id {
+    margin-top: 12px;
   }
 
   .week-head {

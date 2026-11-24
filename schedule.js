@@ -336,6 +336,15 @@
     return true;
   }
 
+  function setDone(state, weekKeyValue, choreId, done) {
+    const week = Object.prototype.hasOwnProperty.call(state.weeks, weekKeyValue) ? state.weeks[weekKeyValue] : null;
+    if (!week) return false;
+    const item = week.assignments.find((assignment) => assignment.choreId === choreId);
+    if (!item) return false;
+    item.done = Boolean(done);
+    return true;
+  }
+
   function historyEntries(state, now = new Date()) {
     const current = weekKey(now);
     return Object.keys(state.weeks)
@@ -372,6 +381,7 @@
     refresh,
     remaining,
     restingRoommates,
+    setDone,
     startOfDay,
     sundayOf,
     toggleDone,
