@@ -30,7 +30,7 @@ The server prints the addresses it is listening on:
 
 The site has to be opened through the server. Opening `index.html` directly no longer works.
 
-Households are saved in `data/households.json`. Keep that file to keep your households. It is not committed to git.
+Without a database, households are saved in `data/households.json`. Keep that file to keep your households. It is not committed to git.
 
 Settings, all optional:
 
@@ -38,9 +38,26 @@ Settings, all optional:
 | --- | --- | --- |
 | `PORT` | `3000` | Port to listen on |
 | `HOST` | `0.0.0.0` | Address to listen on |
-| `DATA_FILE` | `data/households.json` | Where households are saved |
+| `DATA_FILE` | `data/households.json` | Where households are saved when there is no database |
+| `UPSTASH_REDIS_REST_URL` | none | Upstash Redis REST URL. With the token, households are saved there instead of the file |
+| `UPSTASH_REDIS_REST_TOKEN` | none | Upstash Redis REST token. Keep it secret and never commit it |
+| `TZ` | server's zone | Time zone that decides midnight Sunday, for example `Europe/Bucharest` |
+| `TRUST_PROXY` | off | Set to `1` behind a proxy so the wrong-ID limit sees each visitor's address. On Render this is automatic |
 
-To let roommates in when they are not on your Wi-Fi, host it on a Node.js service that keeps a disk between restarts and point `DATA_FILE` at that disk.
+When the server starts it prints where it is saving households and which time zone it uses.
+
+## Put it online
+
+Free hosting services such as Render erase files when the server restarts, so online the households live in a free [Upstash](https://upstash.com) Redis database.
+
+1. Create a Redis database on Upstash and copy its REST URL and REST token.
+2. On [Render](https://render.com), create a Web Service from this GitHub repo with the start command `npm start`.
+3. In the service's **Environment** page, add `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN`, and `TZ`.
+4. Push to GitHub. Render redeploys on every push.
+
+The service log should say `Saving households in Upstash Redis.` If it names a file instead, the two Upstash settings are missing or misspelled.
+
+On the public internet the household ID is the only thing protecting a household. A visitor who enters 20 wrong IDs within 10 minutes is blocked for the rest of that window, and one network can create at most 10 households an hour.
 
 ## How the rotation works
 

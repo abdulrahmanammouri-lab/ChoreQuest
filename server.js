@@ -32,7 +32,15 @@ function isId(value) {
   return typeof value === "string" && value.length === ID_LENGTH && [...value].every((char) => ID_ALPHABET.includes(char));
 }
 
-function createStore(file) {
+function randomId() {
+  return [...crypto.randomBytes(ID_LENGTH)].map((byte) => ID_ALPHABET[byte % ID_ALPHABET.length]).join("");
+}
+
+function clone(state) {
+  return JSON.parse(JSON.stringify(state));
+}
+
+function createFileStore(file) {
   const households = new Map();
 
   try {
@@ -51,15 +59,104 @@ function createStore(file) {
     fs.renameSync(temp, file);
   }
 
-  function newId() {
-    for (;;) {
-      const bytes = crypto.randomBytes(ID_LENGTH);
-      const id = [...bytes].map((byte) => ID_ALPHABET[byte % ID_ALPHABET.length]).join("");
-      if (!households.has(id)) return id;
+  function change(id, state) {
+    const previous = households.get(id);
+    if (state) households.set(id, state);
+    else households.delete(id);
+    try {
+      save();
+    } catch (error) {
+      if (previous) households.set(id, previous);
+      else households.delete(id);
+      throw error;
     }
   }
 
-  return { households, save, newId };
+  return {
+    label: `file ${file}`,
+    async get(id) {
+      return households.has(id) ? clone(households.get(id)) : null;
+    },
+    async create(id, state) {
+      if (households.has(id)) return false;
+      change(id, clone(state));
+      return true;
+    },
+    async put(id, state) {
+      change(id, clone(state));
+    },
+    async remove(id) {
+      change(id, null);
+    },
+  };
+}
+
+function createRedisStore({ url, token, fetchImpl = fetch }) {
+  const endpoint = url.replace(/\/+$/, "");
+  const key = (id) => `chorequest:household:${id}`;
+
+  async function command(...args) {
+    const response = await fetchImpl(endpoint, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(args),
+      signal: AbortSignal.timeout(10000),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || data.error) throw new Error(`Upstash ${args[0]} failed: ${data.error || response.status}`);
+    return data.result;
+  }
+
+  return {
+    label: "Upstash Redis",
+    async get(id) {
+      const raw = await command("GET", key(id));
+      return raw ? CQ.normalize(JSON.parse(raw)) : null;
+    },
+    async create(id, state) {
+      return (await command("SET", key(id), JSON.stringify(state), "NX")) === "OK";
+    },
+    async put(id, state) {
+      await command("SET", key(id), JSON.stringify(state));
+    },
+    async remove(id) {
+      await command("DEL", key(id));
+    },
+  };
+}
+
+function storeFromEnv(env = process.env) {
+  if (env.UPSTASH_REDIS_REST_URL && env.UPSTASH_REDIS_REST_TOKEN) {
+    return createRedisStore({ url: env.UPSTASH_REDIS_REST_URL, token: env.UPSTASH_REDIS_REST_TOKEN });
+  }
+  return createFileStore(env.DATA_FILE || path.join(ROOT, "data", "households.json"));
+}
+
+function createLimiter(limit, windowMs) {
+  const hits = new Map();
+  return {
+    blocked(key) {
+      const entry = hits.get(key);
+      return Boolean(entry) && entry.reset > Date.now() && entry.count >= limit;
+    },
+    hit(key) {
+      const now = Date.now();
+      if (hits.size > 10000) {
+        for (const [name, entry] of hits) if (entry.reset <= now) hits.delete(name);
+      }
+      const entry = hits.get(key);
+      if (!entry || entry.reset <= now) hits.set(key, { count: 1, reset: now + windowMs });
+      else entry.count += 1;
+    },
+  };
+}
+
+function clientKey(req, trustProxy) {
+  if (trustProxy) {
+    const forwarded = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim();
+    if (forwarded) return forwarded;
+  }
+  return req.socket.remoteAddress || "unknown";
 }
 
 function send(res, status, body) {
@@ -115,60 +212,110 @@ function serveStatic(req, res, pathname) {
 }
 
 function createApp(options = {}) {
-  const store = createStore(options.dataFile || path.join(ROOT, "data", "households.json"));
+  const store = options.store || createFileStore(options.dataFile || path.join(ROOT, "data", "households.json"));
   const clock = options.now || (() => new Date());
+  const trustProxy = Boolean(options.trustProxy);
+  const misses = createLimiter(options.missLimit || 20, 10 * 60 * 1000);
+  const creates = createLimiter(options.createLimit || 10, 60 * 60 * 1000);
+  const cache = new Map();
+  const queues = new Map();
 
-  function current(id) {
-    const state = store.households.get(id);
-    if (state && CQ.refresh(state, clock())) store.save();
-    return state;
+  function serial(id, task) {
+    const run = (queues.get(id) || Promise.resolve()).then(task, task);
+    const tail = run.catch(() => {});
+    queues.set(id, tail);
+    tail.then(() => {
+      if (queues.get(id) === tail) queues.delete(id);
+    });
+    return run;
+  }
+
+  async function save(id, state) {
+    await store.put(id, state);
+    cache.set(id, state);
+  }
+
+  async function current(id) {
+    let state = cache.get(id);
+    if (!state) {
+      state = await store.get(id);
+      if (!state) return null;
+      cache.set(id, state);
+    }
+    const next = clone(state);
+    if (CQ.refresh(next, clock())) {
+      await save(id, next);
+      return clone(next);
+    }
+    return next;
+  }
+
+  async function createHousehold(req, res, client) {
+    if (creates.blocked(client)) {
+      return send(res, 429, { error: "Too many new households from this network. Try again in an hour." });
+    }
+    const body = await readJson(req);
+    const base = body.legacy ? CQ.normalize(body.legacy) : CQ.blankState();
+    const result = CQ.applyHousehold(base, body.household || {}, clock());
+    if (!result.ok) return send(res, 400, { error: result.error });
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      const id = randomId();
+      if (cache.has(id) || !(await store.create(id, result.state))) continue;
+      cache.set(id, result.state);
+      creates.hit(client);
+      return send(res, 201, { id, state: result.state });
+    }
+    throw new Error("Could not find a free household ID.");
   }
 
   async function handleApi(req, res, parts) {
+    const client = clientKey(req, trustProxy);
     if (parts.length === 0) {
       if (req.method !== "POST") return send(res, 405, { error: "Method not allowed." });
-      const body = await readJson(req);
-      const base = body.legacy ? CQ.normalize(body.legacy) : CQ.blankState();
-      const result = CQ.applyHousehold(base, body.household || {}, clock());
-      if (!result.ok) return send(res, 400, { error: result.error });
-      const id = store.newId();
-      store.households.set(id, result.state);
-      store.save();
-      return send(res, 201, { id, state: result.state });
+      return createHousehold(req, res, client);
     }
 
     const id = cleanId(parts[0]);
     if (!isId(id)) return send(res, 404, { error: "Household IDs are 6 letters and numbers." });
-    const state = current(id);
-    if (!state) return send(res, 404, { error: "No household has that ID." });
-
-    if (parts.length === 1 && req.method === "GET") return send(res, 200, { id, state });
-
-    if (parts.length === 1 && req.method === "PUT") {
-      const body = await readJson(req);
-      const result = CQ.applyHousehold(state, body.household || {}, clock());
-      if (!result.ok) return send(res, 400, { error: result.error });
-      store.households.set(id, result.state);
-      store.save();
-      return send(res, 200, { id, state: result.state });
+    if (misses.blocked(client)) {
+      return send(res, 429, { error: "Too many wrong household IDs. Wait 10 minutes and try again." });
     }
 
-    if (parts.length === 1 && req.method === "DELETE") {
-      store.households.delete(id);
-      store.save();
-      return send(res, 204);
-    }
+    const isGet = parts.length === 1 && req.method === "GET";
+    const isPut = parts.length === 1 && req.method === "PUT";
+    const isDelete = parts.length === 1 && req.method === "DELETE";
+    const isDone = parts.length === 2 && parts[1] === "done" && req.method === "POST";
+    if (!isGet && !isPut && !isDelete && !isDone) return send(res, 405, { error: "Method not allowed." });
+    const body = isPut || isDone ? await readJson(req) : {};
 
-    if (parts.length === 2 && parts[1] === "done" && req.method === "POST") {
-      const body = await readJson(req);
+    return serial(id, async () => {
+      const state = await current(id);
+      if (!state) {
+        misses.hit(client);
+        return send(res, 404, { error: "No household has that ID." });
+      }
+
+      if (isGet) return send(res, 200, { id, state });
+
+      if (isPut) {
+        const result = CQ.applyHousehold(state, body.household || {}, clock());
+        if (!result.ok) return send(res, 400, { error: result.error });
+        await save(id, result.state);
+        return send(res, 200, { id, state: result.state });
+      }
+
+      if (isDelete) {
+        await store.remove(id);
+        cache.delete(id);
+        return send(res, 204);
+      }
+
       if (!CQ.setDone(state, String(body.week || ""), String(body.choreId || ""), Boolean(body.done))) {
         return send(res, 409, { error: "That chore is no longer on the board.", id, state });
       }
-      store.save();
+      await save(id, state);
       return send(res, 200, { id, state });
-    }
-
-    return send(res, 405, { error: "Method not allowed." });
+    });
   }
 
   return function handle(req, res) {
@@ -201,12 +348,16 @@ function lanAddresses() {
 if (require.main === module) {
   const port = Number(process.env.PORT) || 3000;
   const host = process.env.HOST || "0.0.0.0";
-  const server = http.createServer(createApp({ dataFile: process.env.DATA_FILE }));
+  const store = storeFromEnv();
+  const trustProxy = Boolean(process.env.RENDER) || process.env.TRUST_PROXY === "1";
+  const server = http.createServer(createApp({ store, trustProxy }));
   server.listen(port, host, () => {
     console.log("ChoreQuest is running.");
+    console.log(`  Saving households in ${store.label}.`);
+    console.log(`  Time zone: ${Intl.DateTimeFormat().resolvedOptions().timeZone}`);
     console.log(`  On this computer:   http://localhost:${port}`);
     for (const address of lanAddresses()) console.log(`  On the same Wi-Fi:  http://${address}:${port}`);
   });
 }
 
-module.exports = { createApp, isId, cleanId, ID_LENGTH };
+module.exports = { createApp, createFileStore, createRedisStore, storeFromEnv, isId, cleanId, ID_LENGTH };

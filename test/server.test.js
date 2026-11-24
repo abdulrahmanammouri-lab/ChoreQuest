@@ -4,7 +4,7 @@ const fs = require("node:fs");
 const http = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
-const { createApp, isId } = require("../server.js");
+const { createApp, createRedisStore, storeFromEnv, isId } = require("../server.js");
 
 const household = {
   apartmentName: "Maple",
@@ -18,9 +18,9 @@ const household = {
   ],
 };
 
-async function start(t, dataFile) {
+async function start(t, dataFile, extra = {}) {
   const now = () => new Date(2026, 10, 24, 12, 0, 0);
-  const server = http.createServer(createApp({ dataFile, now }));
+  const server = http.createServer(createApp({ dataFile, now, ...extra }));
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   t.after(() => new Promise((resolve) => server.close(resolve)));
   const base = `http://127.0.0.1:${server.address().port}`;
@@ -98,6 +98,75 @@ test("check-offs and household edits are shared and survive a restart", async (t
 
   assert.equal((await restarted("DELETE", `/api/households/${id}`)).status, 204);
   assert.equal((await restarted("GET", `/api/households/${id}`)).status, 404);
+});
+
+function fakeUpstash() {
+  const data = new Map();
+  const calls = [];
+  async function fetchImpl(url, init) {
+    assert.equal(url, "https://example.upstash.io");
+    assert.equal(init.headers.Authorization, "Bearer secret");
+    const [name, key, value, flag] = JSON.parse(init.body);
+    calls.push(name);
+    let result = null;
+    if (name === "GET") result = data.has(key) ? data.get(key) : null;
+    else if (name === "SET" && flag === "NX" && data.has(key)) result = null;
+    else if (name === "SET") {
+      data.set(key, value);
+      result = "OK";
+    } else if (name === "DEL") result = data.delete(key) ? 1 : 0;
+    return { ok: true, json: async () => ({ result }) };
+  }
+  return { data, calls, store: createRedisStore({ url: "https://example.upstash.io/", token: "secret", fetchImpl }) };
+}
+
+test("households are saved in Upstash and reloaded by a fresh server", async (t) => {
+  const upstash = fakeUpstash();
+  const call = await start(t, tempFile(t), { store: upstash.store });
+  const { data } = await call("POST", "/api/households", { household });
+  assert.equal(upstash.data.has(`chorequest:household:${data.id}`), true);
+
+  await call("POST", `/api/households/${data.id}/done`, { week: "2026-11-22", choreId: "d", done: true });
+  const getsBefore = upstash.calls.filter((name) => name === "GET").length;
+  await call("GET", `/api/households/${data.id}`);
+  await call("GET", `/api/households/${data.id}`);
+  assert.equal(upstash.calls.filter((name) => name === "GET").length, getsBefore);
+
+  const restarted = await start(t, tempFile(t), { store: upstash.store });
+  const reloaded = await restarted("GET", `/api/households/${data.id}`);
+  assert.equal(reloaded.status, 200);
+  assert.equal(reloaded.data.state.weeks["2026-11-22"].assignments.find((item) => item.choreId === "d").done, true);
+
+  assert.equal((await restarted("DELETE", `/api/households/${data.id}`)).status, 204);
+  assert.equal(upstash.data.size, 0);
+});
+
+test("simultaneous check-offs on one household are all kept", async (t) => {
+  const upstash = fakeUpstash();
+  const call = await start(t, tempFile(t), { store: upstash.store });
+  const { data } = await call("POST", "/api/households", { household });
+  await Promise.all([
+    call("POST", `/api/households/${data.id}/done`, { week: "2026-11-22", choreId: "t", done: true }),
+    call("POST", `/api/households/${data.id}/done`, { week: "2026-11-22", choreId: "d", done: true }),
+  ]);
+  const saved = JSON.parse(upstash.data.get(`chorequest:household:${data.id}`));
+  assert.deepEqual(saved.weeks["2026-11-22"].assignments.map((item) => item.done), [true, true]);
+});
+
+test("too many wrong IDs are blocked for a while", async (t) => {
+  const call = await start(t, tempFile(t), { missLimit: 3 });
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    assert.equal((await call("GET", "/api/households/ZZZZZZ")).status, 404);
+  }
+  const blocked = await call("GET", "/api/households/ZZZZZZ");
+  assert.equal(blocked.status, 429);
+  assert.match(blocked.data.error, /Too many wrong household IDs/);
+});
+
+test("the Upstash settings choose the database, otherwise the local file", () => {
+  assert.equal(storeFromEnv({ UPSTASH_REDIS_REST_URL: "https://x.upstash.io", UPSTASH_REDIS_REST_TOKEN: "t" }).label, "Upstash Redis");
+  const fallback = storeFromEnv({ UPSTASH_REDIS_REST_URL: "https://x.upstash.io", DATA_FILE: path.join(os.tmpdir(), "cq-none.json") });
+  assert.match(fallback.label, /^file /);
 });
 
 test("only the app files are served", async (t) => {
