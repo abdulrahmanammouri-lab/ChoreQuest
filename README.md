@@ -22,6 +22,9 @@ You need [Node.js](https://nodejs.org) 18 or newer. There is nothing to install.
 ```bash
 npm start
 ```
+```
+https://chorequest-2lo2.onrender.com
+```
 
 The server prints the addresses it is listening on:
 
